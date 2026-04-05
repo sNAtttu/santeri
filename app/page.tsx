@@ -11,6 +11,7 @@ import ActivityChart from "@/components/charts/ActivityChart";
 import HeartRateChart from "@/components/charts/HeartRateChart";
 import StravaActivitiesChart from "@/components/charts/StravaActivitiesChart";
 import StressResilienceChart from "@/components/charts/StressResilienceChart";
+import NutritionChart from "@/components/charts/NutritionChart";
 import { scoreColor, formatDuration, metersToKm } from "@/lib/utils";
 import type {
   DailySleepModel,
@@ -24,6 +25,7 @@ import type {
   VO2MaxModel,
 } from "@/lib/types/oura";
 import type { StravaActivitySummary, StravaAthlete, StravaAthleteStats } from "@/lib/types/strava";
+import type { MFPDailyNutrition } from "@/lib/types/myfitnesspal";
 
 interface OuraData {
   dailySleep: DailySleepModel[];
@@ -47,7 +49,8 @@ interface StravaData {
 function generateInsights(
   dailySleep: DailySleepModel[],
   stravaActivities: StravaActivitySummary[],
-  readiness: DailyReadinessModel[]
+  readiness: DailyReadinessModel[],
+  mfpDaily: MFPDailyNutrition[]
 ): string[] {
   const insights: string[] = [];
 
@@ -140,6 +143,73 @@ function generateInsights(
     }
   }
 
+  // Nutrition insights (only when MFP data is available)
+  if (mfpDaily.length >= 3) {
+    // Average daily calories for the period
+    const avgCals = Math.round(
+      mfpDaily.reduce((s, d) => s + d.calories, 0) / mfpDaily.length
+    );
+    if (avgCals > 0) {
+      insights.push(`Average daily intake: ${avgCals} kcal over ${mfpDaily.length} logged days.`);
+    }
+
+    // High-protein vs low-protein days: sleep score comparison
+    const mfpByDay: Record<string, MFPDailyNutrition> = {};
+    for (const d of mfpDaily) mfpByDay[d.date] = d;
+
+    const proteinValues = mfpDaily.map((d) => d.protein).filter((p) => p > 0);
+    if (proteinValues.length >= 4) {
+      const medianProtein =
+        [...proteinValues].sort((a, b) => a - b)[Math.floor(proteinValues.length / 2)];
+
+      const sleepHighProtein: number[] = [];
+      const sleepLowProtein: number[] = [];
+
+      for (const s of dailySleep) {
+        if (s.score == null || s.score === 0) continue;
+        const nutrition = mfpByDay[s.day];
+        if (!nutrition) continue;
+        if (nutrition.protein >= medianProtein) {
+          sleepHighProtein.push(s.score);
+        } else {
+          sleepLowProtein.push(s.score);
+        }
+      }
+
+      if (sleepHighProtein.length >= 2 && sleepLowProtein.length >= 2) {
+        const avgHigh = Math.round(
+          sleepHighProtein.reduce((a, b) => a + b, 0) / sleepHighProtein.length
+        );
+        const avgLow = Math.round(
+          sleepLowProtein.reduce((a, b) => a + b, 0) / sleepLowProtein.length
+        );
+        const diff = avgHigh - avgLow;
+        if (Math.abs(diff) >= 3) {
+          insights.push(
+            diff > 0
+              ? `Sleep score averaged ${diff} points higher on high-protein days (≥${Math.round(medianProtein)}g): ${avgHigh} vs ${avgLow}.`
+              : `Sleep score averaged ${Math.abs(diff)} points lower on high-protein days (≥${Math.round(medianProtein)}g): ${avgHigh} vs ${avgLow}.`
+          );
+        }
+      }
+    }
+
+    // Energy balance: MFP calories vs Oura total calories burned (if readiness data has activity)
+    const ouraByDay: Record<string, number> = {};
+    for (const r of readiness) {
+      // Use readiness day as proxy for the date
+      if (r.day) ouraByDay[r.day] = 0;
+    }
+
+    // Count days with a caloric surplus (intake > ~2000 kcal as rough threshold)
+    const highCalDays = mfpDaily.filter((d) => d.calories > 2500).length;
+    if (highCalDays > 0) {
+      insights.push(
+        `${highCalDays} day${highCalDays !== 1 ? "s" : ""} with intake above 2500 kcal in this period.`
+      );
+    }
+  }
+
   return insights;
 }
 
@@ -159,16 +229,20 @@ function DashboardContent() {
 
   const [oura, setOura] = useState<OuraData | null>(null);
   const [strava, setStrava] = useState<StravaData | null>(null);
+  const [mfpDaily, setMfpDaily] = useState<MFPDailyNutrition[]>([]);
   const [ouraError, setOuraError] = useState<string | null>(null);
   const [stravaError, setStravaError] = useState<string | null>(null);
+  const [mfpError, setMfpError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
     setOura(null);
     setStrava(null);
+    setMfpDaily([]);
     setOuraError(null);
     setStravaError(null);
+    setMfpError(null);
 
     const qs = `?startDate=${startDate}&endDate=${endDate}`;
 
@@ -187,6 +261,13 @@ function DashboardContent() {
           else setStrava(json);
         })
         .catch((e: unknown) => setStravaError(String(e))),
+      fetch(`/api/myfitnesspal${qs}`)
+        .then(async (r) => {
+          const json = await r.json();
+          if (!r.ok) setMfpError(json.error ?? "Unknown MyFitnessPal error");
+          else if (json.available) setMfpDaily(json.daily ?? []);
+        })
+        .catch((e: unknown) => setMfpError(String(e))),
     ]);
 
     setLoading(false);
@@ -198,7 +279,7 @@ function DashboardContent() {
 
   const insights =
     oura && strava
-      ? generateInsights(oura.dailySleep, strava.activities, oura.readiness)
+      ? generateInsights(oura.dailySleep, strava.activities, oura.readiness, mfpDaily)
       : [];
 
   const latestSleep = oura?.dailySleep.at(-1);
@@ -222,6 +303,12 @@ function DashboardContent() {
     0
   );
   const totalStravaActivities = strava?.activities.length ?? 0;
+
+  // MFP nutrition averages
+  const avgCalories = avg(mfpDaily.map((d) => d.calories).filter((c) => c > 0));
+  const avgProtein = avg(mfpDaily.map((d) => d.protein).filter((p) => p > 0));
+  const avgCarbs = avg(mfpDaily.map((d) => d.carbohydrates).filter((c) => c > 0));
+  const avgFat = avg(mfpDaily.map((d) => d.fat).filter((f) => f > 0));
 
   const latestSleepTotal = oura?.sleepPeriods
     .filter((p) => p.day === latestSleep?.day && p.type !== "deleted")
@@ -319,6 +406,41 @@ function DashboardContent() {
                     value={metersToKm(totalStravaDistance)}
                     unit="km"
                     description="total"
+                  />
+                </div>
+              </section>
+            )}
+
+            {/* Nutrition summary metrics */}
+            {mfpDaily.length > 0 && (
+              <section>
+                <h2 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">
+                  Nutrition averages (MyFitnessPal)
+                </h2>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <MetricCard
+                    label="Calories"
+                    value={avgCalories}
+                    unit="kcal"
+                    description="avg / logged day"
+                  />
+                  <MetricCard
+                    label="Protein"
+                    value={avgProtein}
+                    unit="g"
+                    description="avg / logged day"
+                  />
+                  <MetricCard
+                    label="Carbs"
+                    value={avgCarbs}
+                    unit="g"
+                    description="avg / logged day"
+                  />
+                  <MetricCard
+                    label="Fat"
+                    value={avgFat}
+                    unit="g"
+                    description="avg / logged day"
                   />
                 </div>
               </section>
@@ -520,8 +642,22 @@ function DashboardContent() {
               </section>
             )}
 
+            {/* Nutrition */}
+            {mfpDaily.length > 0 && (
+              <section className="bg-white rounded-lg border border-gray-200 p-5">
+                <h2 className="text-base font-semibold text-gray-900 mb-1">
+                  Nutrition (MyFitnessPal)
+                </h2>
+                <p className="text-xs text-gray-400 mb-4">
+                  Stacked bars = macros in grams (protein / carbs / fat). Green line = total calories.
+                  Hover a day for meal breakdown.
+                </p>
+                <NutritionChart daily={mfpDaily} />
+              </section>
+            )}
+
             {/* Non-connection errors */}
-            {(ouraError || stravaError) && (
+            {(ouraError || stravaError || mfpError) && (
               <section className="space-y-2">
                 {ouraError && !ouraError.includes("not connected") && (
                   <p className="text-xs text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2">
@@ -531,6 +667,11 @@ function DashboardContent() {
                 {stravaError && !stravaError.includes("not connected") && (
                   <p className="text-xs text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2">
                     Strava: {stravaError}
+                  </p>
+                )}
+                {mfpError && (
+                  <p className="text-xs text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2">
+                    MyFitnessPal: {mfpError}
                   </p>
                 )}
               </section>

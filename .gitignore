@@ -42,3 +42,6 @@ next-env.d.ts
 
 # token storage (contains OAuth tokens - never commit)
 tokens.json
+
+# MyFitnessPal nutrition export (personal health data - never commit)
+data/*.csv
